@@ -1,10 +1,9 @@
 package main
 
 import (
+	// Standard library imports
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 
+	// Third-party imports
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -50,7 +50,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	fmt.Println("uploading video for video", videoID, "by user", userID)
+	fmt.Println("\nUploading video for video", videoID, "by user", userID)
 
 	// Get the video metadata from the database
 	video, err := cfg.db.GetVideo(videoID)
@@ -102,6 +102,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't get video aspect ratio", err)
 		return
@@ -124,39 +125,48 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Upload the video file to S3
-	// Generate a random filename for the video in S3 to avoid collisions and security issues
-	key := make([]byte, 32)
-	_, err = rand.Read(key)
+	// Process the video for fast start to optimize for streaming
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't generate random bytes for thumbnail filename", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for fast start", err)
 		return
 	}
-	// Convert to random base64 string
-	randomName := base64.RawURLEncoding.EncodeToString(key)
+	defer os.Remove(processedFilePath) // Clean up processed file after uploading
 
-	s3Key := fmt.Sprintf("%s/videos/%s.mp4", aspectString, randomName)
+	// Create the video URL that will be stored in the database and returned to the client.
+	s3Key := fmt.Sprintf("%s/%s.mp4", aspectString, videoID.String())
+	videoURL := fmt.Sprintf("https://%s/%s", cfg.s3CfDistribution, s3Key)
+	fmt.Printf("\nVideoURL = %s", videoURL)
+	
+
+	// Open the processed file for reading
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open processed video file", err)
+		return
+	}
+	defer processedFile.Close()
 
 	_, err = cfg.s3Client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(s3Key),
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
-
-	// Update the videoURL in the database to point to the S3 URL
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, s3Key)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't upload video to S3", err)
+		return
+	}
+	// Update the database with the video URL
 	video.VideoURL = &videoURL
-
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video metadata with video URL", err)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]string{
-		"videoURL": videoURL,
-	})
+	// Respond with the signed video URL
+	respondWithJSON(w, http.StatusOK, video)
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
@@ -189,7 +199,6 @@ func getVideoAspectRatio(filePath string) (string, error) {
 		return "", errors.New("no streams found in ffprobe output")
 	}
 
-	fmt.Printf("ffprobe output: %+v\n", ffprobeOutput)
 	// Return the aspect ratio as a string in the format "width:height"
 
 	// Calculate the actual ratio of the video
@@ -207,4 +216,18 @@ func getVideoAspectRatio(filePath string) (string, error) {
 
 	// If it's anything else (like a square 1:1 or old 4:3)
 	return "other", nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	// Create a new string for the output file path
+	outputFilePath := filePath[:len(filePath)-len(".mp4")] + "-faststart.mp4"
+
+	// Run ffmpeg to process the video for fast start
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return outputFilePath, nil
 }
